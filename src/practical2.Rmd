@@ -1,0 +1,286 @@
+---
+title: ' Microbial Data Analysis Course Part 1'
+author: "Ece Kartal"
+output:
+  pdf_document:
+    toc: yes
+  html_notebook:
+    toc: yes
+    number_sections: no
+    toc_float: yes
+    theme: spacelab
+    code_folding: none
+  html_document:
+    toc: yes
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+
+This vignette contains the course schedule and material of the **Microbiome Data Analysis & Visualization Course**. 
+
+## Loading packages and data in R
+
+Before we start with any analysis, it is good practice to load all
+required libraries. This will also immediately identify libraries that
+may be missing. Note that for this course, we pre-installed all
+libraries for you. When you run your own analysis, you have to check
+which libraries are already available, and which are not. We use
+`suppressPackageStartupMessages` here to suppress the output messages of
+the various packages for reasons of brevity.
+
+When using functions that sample pseudorandom numbers, each time you
+execute them you will obtain a different result. For the purpose of this
+vignette, this is not what we want. We therefore set a particular seed
+value(here: 1881) so that the result will always be the same. For more
+information, check out [this webpage](https://r-coder.com/set-seed-r)
+that explains this general concept in more detail.
+
+```{r library, eval=TRUE}
+suppressPackageStartupMessages({
+library(knitr)
+library(tidyverse)
+library(ggrepel)
+library(ggplot2)
+library(pROC)
+library(SIAMCAT)
+})
+
+set.seed(1881)
+```
+
+Next, we read the data tables that contain the count matrix and samples' metadata. 
+```{r loadData, message=FALSE}
+# set the working directory
+folder <- gsub("/src", "", getwd())
+folder.results <- paste0(folder, "/output/")
+file.path(folder, 'data/mobi.Rdata')
+
+# load data
+load(file=file.path(folder, '/data/motu.relative.Rdata'))
+```
+
+################################################################################
+## Differential Abundance Analysis with Wilcoxin Test
+################################################################################
+
+Next, we can analyze the differences between the microbiome profiles of both groups. To do so, we use `wilcoxin test` which is a statistical test where all species in the count matrix are compared between the sample groups of interest.  `wilcoxin test` is not the only option to perform Differential Abundance Analysis. Common alternatives include [`edgeR`](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2796818/) and [`DESeq2`](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-014-0550-8). More on the topic, we can read here: 
+https://microbiome.github.io/OMA/differential-abundance.html
+
+A **Wilcoxon test** estimates the difference in an outcome between two groups. It is a non-parametric alternative to a t-test, which means that the Wilcoxon test does not make any assumptions about the data.
+
+```{r differentialAbundance}
+featTable = motu.fil.rel
+# subset meta accordingly
+metaTable = meta[meta$ID %in% colnames(motu.fil.rel),]
+# define cutoffs
+p_cutoff = 0.1
+##############################################################################
+p.cal <- tribble(~ID, ~pval, ~adj.pval, ~log10.adj, ~aucs.mat, ~fc, ~sig)
+  
+for (rowname in row.names(featTable)) {
+  
+    # define matrix to compare
+    x <- as.numeric(featTable[rowname, metaTable %>% filter(status=='PC') %>% pull(ID)])
+    y <- as.numeric(featTable[rowname, metaTable %>% filter(status=='CTR') %>% pull(ID)])
+
+    # Fold change
+    q.p <- quantile(log10(x+1e-05), probs=seq(.1, .9, .05))
+    q.n <- quantile(log10(y+1e-05), probs=seq(.1, .9, .05))
+   
+    # create matrix
+    p.cal=add_row(p.cal, 
+                  ID = rowname,
+                  pval = wilcox.test(x, y, exact=FALSE)$p.value,
+                  aucs.mat = roc(controls=y, cases=x, direction='<', ci=TRUE, auc=TRUE)$ci[2], 
+                  fc = sum(q.p - q.n)/length(q.p))
+}
+
+# p.adjust
+p.cal <- p.cal %>% 
+  mutate(adj.pval = p.adjust(pval, method = "BH")) %>%
+  mutate(sig = ifelse(adj.pval < p_cutoff, "p.adj < 0.05", "not sig")) %>%
+  mutate(log10.adj = -log10(adj.pval))
+
+# Lets have a look to results
+p.cal
+
+# save file
+write.table(p.cal, file=paste0(folder.results, 'wilcox.results.tsv'), 
+            sep='\t', row.names=TRUE, col.names=TRUE)
+```
+
+And look at the distribution of the adjusted P values:
+
+```{r histogram}
+ggplot2::ggplot(p.cal, aes(x = pval)) +
+  ggplot2::geom_histogram(bins = 100)
+```
+
+**NOTE:** Do you remember how the P-value distribution should look like? If not, please see [here](http://varianceexplained.org/statistics/interpreting-pvalue-histogram/).
+
+We can also visualize the abundance changes  using one of the most common plots to explore  Differential Abundance Analysis results, the **volcano plot**:
+
+```{r volcanoPlot}
+# Volcano plot 
+p.wilcox.1 <- ggplot(p.cal, aes(x = fc, y = log10.adj)) +
+  geom_point(aes(color = sig), alpha=0.7) +
+  scale_color_manual(values = c("black","red")) +
+  # add a line for significance
+  geom_hline(yintercept=-log10(p_cutoff)) +
+  # add ID for significant species
+  geom_text_repel(data = subset(p.cal, adj.pval < p_cutoff), aes(label = ID), size = 3) +
+  # add axis labels 
+  ggtitle("Differentially abundant species") +
+  xlab("Generalized fold change") + 
+  ylab("Log10 adjusted p-value") +
+  theme_classic()
+  
+p.wilcox
+# save the plot
+ggsave(p.wilcox, filename=paste0(folder.results, "wilcox.volcano.plot.pdf"))
+```
+
+A volcano plot enables us to quickly visualize the magnitude (logFC) and significance (-log10(pvalue)) of DAA changes. Each point represent a species, and its color indicates whether they surpass or not a cutoff of  an adjusted P value < `0.05`. 
+
+**QUESTION**: What does the horizontal line mean in this plot? Take a look at the code and think about their meaning. 
+
+**QUESTION**: Try to modify the and `p_cutoff` variables in this chunk. What happens?
+
+################################################################################
+## Modelling by SIAMCAT
+################################################################################
+
+`SIAMCAT` (Statistical Inference of Associations between Microbial Communities And host phenoTypes) is a comprehensive toolbox for comparative metagenome analysis using ML, statistical modeling, and advanced visualization approaches [paper here](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-021-02306-1).
+
+`SIAMCAT` needs:
+
+- a feature matrix (matrix or data.frame) that has features (in rows) samples (in columns)
+- metadata in a data.frame, samples as row names
+
+For microbiome studies, many issues arise from key characteristics of metagenomic data such as 
+
+- large technical and inter-individual variation
+- experimental bias, 
+- compositionality of relative abundances, 
+- zero inflation, 
+- non-Gaussian distribution, all of which necessitate data normalization in order for ML algorithms to work well.
+
+Please note that `SIAMCAT` is supposed to work with *relative abundances*. 
+
+```{r SiamcatObject, results='hold'}
+# define files and parameters
+meta.train <- meta
+feat.train <- motu.rel
+test.meta <- c("age",  "center", "smoking", "periodontitis", "gender", "alcohol_status")
+
+# start modelling
+siamcat <- siamcat(feat=feat.train, meta=meta.train, label = 'status', case='PC')
+
+# SIAMCAT builds on the phyloseq data structure
+show(siamcat)
+```
+
+Since we have quite a lot of microbial species in the dataset at the moment, we can perform *unsupervised feature selection* using the function `filter.features`
+
+```{r SiamcatTests, results='hold'}
+# filter based on abundance
+siamcat <- filter.features(siamcat, filter.method = 'abundance', 
+                             cutoff=0.001, verbose=3)
+
+
+# The check.confounders function provides the option to test the associated metadata 
+# variables for potential confounding influence.
+check.confounders(siamcat, fn.plot = paste0(folder.results, 'confounders.pdf'),
+                  meta.in = test.meta, verbose = 3)
+
+# normalise count matrix
+siamcat <- normalize.features(siamcat, norm.method = "log.clr",
+                              norm.param = list(log.n0 = 1e-05, sd.min.q = 1),
+                              verbose=3)
+
+# Associations between microbial species and the label can be tested with the 
+# *check.associations* function
+siamcat <- check.associations(siamcat, 
+                              feature.type = 'normalized')
+```
+
+`SIAMCAT` contains functions for data normalization, splitting the data into cross-validation folds, training the model, and making predictions based on cross-validation instances and the trained models.Here, we choose a 10 times-repeated 10-fold cross-validation scheme.
+
+The models are saved in the **model_list** slot of the *SIAMCAT* object. The model building is performed using the `mlr` R package. All models can easily be accessed.
+
+```{r SiamcatModelling, results='hold'}
+# split data for nested cross validation  
+siamcat <- create.data.split(siamcat, num.folds = 5, num.resample = 5)
+# run model
+siamcat <- train.model(siamcat, method = "lasso_ll")
+```
+
+We want to find out how well the model performed and which microbial species had been selected in the model. In order to do so, we first calculate how well the predictions fit the real data using the function `evaluate.predictions`. This function calculates the Area Under the Receiver Operating Characteristic (ROC) Curve (**AU-ROC**) and the Precision Recall (PR) Curve for each resampled cross-validation run.
+
+```{r model Eval, results='hold'}
+siamcat <- make.predictions(siamcat)
+# evaluate model
+siamcat <- evaluate.predictions(siamcat)
+# evaluation plot based on AUROC
+model.evaluation.plot(siamcat)
+# to save it
+model.evaluation.plot(siamcat, fn.plot = paste0(folder.results, 'evaluation.plot.pdf'))
+```
+
+The final plot produced by `SIAMCAT` is the model interpretation plot, created by the `model.interpretation.plot` function. The plot shows for the top selected features the
+
+- model weights (and how robust they are) as a barplot,
+- a heatmap with the z-scores or fold changes for the top selected features, and
+- a boxplot showing the proportions of weight per model which is captured by the top selected features.
+
+```{r interpretPlot, results='hold'}
+# interpretation plot with heatmap
+model.interpretation.plot(siamcat, 
+                          consens.thres = 0.5,
+                          heatmap.type = 'zscore',
+                          fn.plot = paste0(folder.results, 'interpret.plot.pdf'))
+  
+# save modelling matrix
+save(siamcat, file=paste0(folder.results, 'siamcat.lassoll.model.RData'))
+```
+
+## Adding metadata variables to microbial model
+
+`add.meta.pred` functions adds one or several metadata variables to the set of features, so that they can be
+included for model training. Numerical meta-variables are added as z-scores to the feature matrix unless specified otherwise.
+
+```{r AddingMetadata}
+# add metadata to the feature matrix to be later used as predictors
+add.meta <- function(x, n){
+  x <- add.meta.pred(x, pred.names = n, verbose=3,std.meta=FALSE)
+  x <- train.model(x, method='lasso_ll', verbose=2, perform.fs = TRUE)
+                   
+  x <- make.predictions(x)
+  x <- evaluate.predictions(x)
+  return(x)
+}
+# combine smoking information with naive microbiome model
+siamcat.c <- add.meta(siamcat, 'diabetes')
+
+# lets see the comparison of only microbiome-based model and microbiome+smoking
+model.evaluation.plot('Only MetaG'= siamcat,
+                      'MetaG and diabetes'= siamcat.c)
+
+# to save it
+model.evaluation.plot('Only MetaG'= siamcat,
+                      'MetaG and diabetes'= siamcat.c,
+                      fn.plot = paste0(folder.results, 'metag.diabetes.combined.pdf'))
+```
+
+## Session info
+
+It is good practice to print the so-called session info at the end of an
+R script, which prints all loaded libraries, their versions etc. This
+can be helpful for reproducibility and recapitulating which package
+versions have been used to produce the results obtained above.
+
+```{r sessionInfo}
+sessionInfo()
+```
